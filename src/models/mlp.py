@@ -1,3 +1,14 @@
+"""
+Multi-Layer Perceptron (MLP) module.
+
+Provides both a standard float-precision MLP (FloatMLP) and a ternary-weight
+variant (TernaryMLP) with conservation regularization, confidence tracking,
+and POLLN-style tile interfaces for the SuperInstance architecture.
+
+The original ``MLP`` name is preserved as a backward-compatible alias that
+defaults to ``FloatMLP``, with an optional ``ternary`` switch.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +18,7 @@ from src.conservation import conservation_loss, ternary_quantize
 from src.confidence import ConfidenceTile, get_zone, Zone
 
 
-class MLP(nn.Module):
+class FloatMLP(nn.Module):
     """
     A simple Multi-Layer Perceptron with one hidden layer.
 
@@ -20,7 +31,7 @@ class MLP(nn.Module):
     """
     def __init__(self, n_embed: int) -> None:
         """
-        Initializes the MLP module.
+        Initializes the FloatMLP module.
 
         Args:
             n_embed (int): The dimensionality of the input embedding.
@@ -32,7 +43,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass through the MLP.
+        Forward pass through the FloatMLP.
 
         Args:
             x (torch.Tensor): Input tensor of shape (B, T, C), where B is batch size,
@@ -70,6 +81,10 @@ class MLP(nn.Module):
         """
         x = self.proj(x)
         return x
+
+
+# --- Backward-compatible alias ---
+MLP = FloatMLP
 
 
 class TernaryMLP(nn.Module):
@@ -212,6 +227,21 @@ class TernaryMLP(nn.Module):
         )
 
 
+# --- Convenience factory ---
+def make_mlp(n_embed: int, ternary: bool = False) -> nn.Module:
+    """
+    Factory function — returns either a FloatMLP or a TernaryMLP.
+
+    Args:
+        n_embed: The embedding dimensionality.
+        ternary: If True, return a ``TernaryMLP``; otherwise a ``FloatMLP``.
+
+    Returns:
+        An ``nn.Module`` instance of the requested type.
+    """
+    return TernaryMLP(n_embed) if ternary else FloatMLP(n_embed)
+
+
 if __name__ == '__main__':
     # Example Usage (optional, for testing the module independently)
     batch_size = 2
@@ -219,8 +249,18 @@ if __name__ == '__main__':
     embedding_dim = 16
     input_tensor = torch.randn(batch_size, sequence_length, embedding_dim)
 
+    # Test FloatMLP (via the backward-compatible MLP alias)
     mlp_module = MLP(n_embed=embedding_dim)
     output_tensor = mlp_module(input_tensor)
 
-    print("MLP Input Shape:", input_tensor.shape)
-    print("MLP Output Shape:", output_tensor.shape)
+    print("FloatMLP (alias MLP) Input Shape:", input_tensor.shape)
+    print("FloatMLP (alias MLP) Output Shape:", output_tensor.shape)
+
+    # Test TernaryMLP
+    tmlp = TernaryMLP(n_embed=embedding_dim)
+    out_t = tmlp(input_tensor)
+    print("TernaryMLP Input Shape:", input_tensor.shape)
+    print("TernaryMLP Output Shape:", out_t.shape)
+    print("TeraryMLP confidence:", tmlp.confidence)
+    print("TernaryMLP zone:", tmlp.zone)
+    print("TernaryMLP trace:", tmlp.trace)

@@ -5,10 +5,17 @@ import math
 from typing import List, Optional, Tuple
 from src.confidence import Zone, get_zone
 
+# Try to import conservation regularization (optional)
+try:
+    from src.conservation import conservation_loss, ternary_quantize, spectral_normalize
+    _conservation_available = True
+except ImportError:
+    _conservation_available = False
 
-class Head(nn.Module):
+
+class FloatHead(nn.Module):
     """
-    A single attention head.
+    A single attention head with full-precision (float) weights.
 
     This module calculates attention scores and applies them to the values.
     It includes key, query, and value projections, and uses causal masking
@@ -60,61 +67,21 @@ class Head(nn.Module):
         out = attn_weights @ v # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
         return out
 
-class MultiHeadAttention(nn.Module):
+
+# Backward-compatible alias
+Head = FloatHead
+
+
+class TernaryHead(FloatHead):
     """
-    Multi-Head Attention module.
+    A single attention head with ternary-quantized weights and confidence cascade.
 
-    This module combines multiple attention heads in parallel. The outputs of each head
-    are concatenated and passed through a final linear projection to form the output.
-
-    Args:
-        n_head (int): The number of parallel attention heads.
-        n_embed (int): The dimensionality of the input embedding.
-        context_length (int): The maximum length of the input sequence.
-    """
-    def __init__(self, n_head: int, n_embed: int, context_length: int) -> None:
-        """
-        Initializes the multi-head attention module.
-
-        Args:
-            n_head (int): The number of parallel attention heads.
-            n_embed (int): The dimensionality of the input embedding.
-            context_length (int): The maximum length of the input sequence.
-        """
-        super().__init__()
-        self.heads = nn.ModuleList([Head(n_embed // n_head, n_embed, context_length) for _ in range(n_head)])
-        self.proj = nn.Linear(n_embed, n_embed)
-        self.head_size = n_embed // n_head
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the multi-head attention.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, T, C).
-
-        Returns:
-            torch.Tensor: Output tensor after concatenating the heads and applying the output projection.
-        """
-        # Concatenate the output of each head along the last dimension (C)
-        x = torch.cat([h(x) for h in self.heads], dim=-1)
-        # Apply final linear projection
-        x = self.proj(x)
-        return x
-
-
-# Alias: FloatHead for clarity alongside ternary alternatives.
-FloatHead = Head
-
-
-class TernaryHead(Head):
-    """
-    A single attention head with confidence cascade — SuperInstance refactor.
-
-    Inherits from Head and adds:
-      - Confidence scoring after softmax (GREEN ≥ 0.90, YELLOW ≥ 0.75, RED < 0.75)
-      - Trace recording of top-k attended positions
-      - confidence_score property returning the Zone
+    Extends FloatHead with:
+      - Ternary quantization of key/query/value weights to {-1, 0, +1}
+        using straight-through estimator from src/conservation.ternary_quantize.
+      - Confidence cascade after softmax (GREEN >= 0.90, YELLOW >= 0.75, RED < 0.75).
+      - trace_attention() method for explainability (top-k attended positions).
+      - Conservation regularization via src.conservation.conservation_loss when available.
 
     Args:
         head_size (int): The dimensionality of the key, query, and value projections.
@@ -125,12 +92,33 @@ class TernaryHead(Head):
         super().__init__(head_size, n_embed, context_length)
         self._last_attn_weights: Optional[torch.Tensor] = None
         self._last_confidence: float = 1.0
-        self._trace: List[Tuple[int, int, float]] = []  # (batch, pos, score)
-        self.register_buffer('_tril_indices', torch.tril(torch.ones(context_length, context_length)))
+        self._trace: List[Tuple[int, int, float]] = []
+        self._last_input: Optional[torch.Tensor] = None
+        self._last_output: Optional[torch.Tensor] = None
+
+    def _ternary_forward(self, x: torch.Tensor, weight: nn.Parameter) -> torch.Tensor:
+        """Compute linear transformation with ternary-quantized weights."""
+        if _conservation_available:
+            w_ternary = ternary_quantize(weight)
+        else:
+            # Fallback: simple sign-based ternary quantization
+            scale = weight.abs().mean() + 1e-8
+            normalised = weight / scale
+            w_ternary = torch.where(
+                normalised.abs() < 0.5,
+                torch.zeros_like(normalised),
+                torch.sign(normalised),
+            )
+            w_ternary = w_ternary.detach() + weight - weight.detach()
+        return F.linear(x, w_ternary, None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the ternary attention head with confidence scoring.
+
+        Key, query, and value projections use ternary-quantized weights.
+        After softmax, confidence is computed as the mean of maximum attention
+        probabilities, then mapped to a Zone (GREEN/YELLOW/RED).
 
         Args:
             x (torch.Tensor): Input tensor of shape (B, T, C).
@@ -140,20 +128,29 @@ class TernaryHead(Head):
         """
         B, T, C = x.shape
         head_size = self.key.out_features
-        k = self.key(x)
-        q = self.query(x)
         scale_factor = 1 / math.sqrt(head_size)
+
+        # Ternary-quantized projections
+        k = self._ternary_forward(x, self.key.weight)      # (B, T, head_size)
+        q = self._ternary_forward(x, self.query.weight)     # (B, T, head_size)
+
+        # Attention weights with causal masking
         attn_weights = q @ k.transpose(-2, -1) * scale_factor
         attn_weights = attn_weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         attn_weights = F.softmax(attn_weights, dim=-1)
 
-        # Confidence cascade: average maximum attention weight
+        # Confidence cascade: mean of max attention probability per token
         max_attn = attn_weights.max(dim=-1).values  # (B, T)
         self._last_confidence = max_attn.mean().item()
         self._last_attn_weights = attn_weights.detach()
 
-        v = self.value(x)
+        # Ternary-quantized value projection
+        v = self._ternary_forward(x, self.value.weight)     # (B, T, head_size)
         out = attn_weights @ v
+
+        self._last_input = x.detach()
+        self._last_output = out.detach()
+
         return out
 
     def trace_attention(self, top_k: int = 3) -> List[Tuple[int, int, float]]:
@@ -161,7 +158,7 @@ class TernaryHead(Head):
         Record the top-k attended positions for each batch item.
 
         Args:
-            top_k (int): Number of top attended positions to record.
+            top_k (int): Number of top attended positions to record (default: 3).
 
         Returns:
             List of (batch_index, position, attention_score) tuples.
@@ -180,6 +177,21 @@ class TernaryHead(Head):
         self._trace = trace
         return trace
 
+    def conservation_loss(self) -> torch.Tensor:
+        """
+        Compute conservation loss on this head's last forward pass activations.
+
+        Returns a scalar tensor penalising deviation from Σ(Δ_activations) ≈ 0.
+        Falls back to returning 0.0 if conservation module is unavailable or
+        no forward pass has been recorded yet.
+
+        Returns:
+            torch.Tensor: Scalar conservation loss.
+        """
+        if not _conservation_available or self._last_output is None:
+            return torch.tensor(0.0)
+        return conservation_loss(self._last_output, dim=1)
+
     @property
     def confidence_score(self) -> Zone:
         """Return the confidence Zone for this head's last forward pass."""
@@ -191,12 +203,62 @@ class TernaryHead(Head):
         return self._last_confidence
 
 
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-Head Attention module.
+
+    This module combines multiple attention heads in parallel. The outputs of each head
+    are concatenated and passed through a final linear projection to form the output.
+
+    Use the ``ternary`` toggle to switch between FloatHead and TernaryHead.
+
+    Args:
+        n_head (int): The number of parallel attention heads.
+        n_embed (int): The dimensionality of the input embedding.
+        context_length (int): The maximum length of the input sequence.
+        ternary (bool): If True, use TernaryHead (ternary-quantized weights with
+                        confidence cascade). Defaults to False.
+    """
+    def __init__(self, n_head: int, n_embed: int, context_length: int, ternary: bool = False) -> None:
+        """
+        Initializes the multi-head attention module.
+
+        Args:
+            n_head (int): The number of parallel attention heads.
+            n_embed (int): The dimensionality of the input embedding.
+            context_length (int): The maximum length of the input sequence.
+            ternary (bool): If True, use TernaryHead instead of FloatHead.
+        """
+        super().__init__()
+        head_class = TernaryHead if ternary else FloatHead
+        self.heads = nn.ModuleList([head_class(n_embed // n_head, n_embed, context_length) for _ in range(n_head)])
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.head_size = n_embed // n_head
+        self.ternary = ternary
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the multi-head attention.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, T, C).
+
+        Returns:
+            torch.Tensor: Output tensor after concatenating the heads and applying the output projection.
+        """
+        # Concatenate the output of each head along the last dimension (C)
+        x = torch.cat([h(x) for h in self.heads], dim=-1)
+        # Apply final linear projection
+        x = self.proj(x)
+        return x
+
+
 class TernaryMultiHeadAttention(MultiHeadAttention):
     """
-    Multi-Head Attention using TernaryHead — SuperInstance refactor.
+    Multi-Head Attention using TernaryHead.
 
-    Uses TernaryHead instances instead of standard Heads, providing
-    confidence cascade and trace capabilities per head.
+    Convenience subclass of MultiHeadAttention that always uses TernaryHead,
+    providing confidence cascade and trace capabilities per head.
 
     Args:
         n_head (int): The number of parallel attention heads.
@@ -204,12 +266,7 @@ class TernaryMultiHeadAttention(MultiHeadAttention):
         context_length (int): The maximum length of the input sequence.
     """
     def __init__(self, n_head: int, n_embed: int, context_length: int) -> None:
-        super().__init__(n_head, n_embed, context_length)
-        # Replace heads with TernaryHead instances
-        head_size = n_embed // n_head
-        self.heads = nn.ModuleList([
-            TernaryHead(head_size, n_embed, context_length) for _ in range(n_head)
-        ])
+        super().__init__(n_head, n_embed, context_length, ternary=True)
 
     def confidence_distribution(self) -> dict:
         """
@@ -236,6 +293,7 @@ class TernaryMultiHeadAttention(MultiHeadAttention):
         """
         return [h.trace_attention(top_k=top_k) for h in self.heads]
 
+
 if __name__ == '__main__':
     # Example Usage (optional, for testing the module independently)
     batch_size = 2
@@ -250,3 +308,10 @@ if __name__ == '__main__':
 
     print("MultiHeadAttention Input Shape:", input_tensor.shape)
     print("MultiHeadAttention Output Shape:", output_tensor.shape)
+
+    # Test ternary variant
+    ternary_mha = TernaryMultiHeadAttention(n_head=num_heads, n_embed=embedding_dim, context_length=context_len)
+    tern_output = ternary_mha(input_tensor)
+    print("\nTernaryMultiHeadAttention Output Shape:", tern_output.shape)
+    print("Confidence distribution:", ternary_mha.confidence_distribution())
+    print("Head traces:", ternary_mha.trace_all_heads(top_k=2))

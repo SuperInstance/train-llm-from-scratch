@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
-from src.models.transformer_block import Block, TernaryBlock
+from src.models.transformer_block import Block
+
+# Dynamically imported to avoid circular import chains:
+# TernaryBlock is imported lazily inside __init__ when ternary_weights=True.
 
 
 class Transformer(nn.Module):
@@ -51,6 +54,8 @@ class Transformer(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, n_embed)
         self.position_embed = nn.Embedding(context_length, n_embed)
         if ternary_weights:
+            # Lazy import to avoid circular dependency chains
+            from src.models.transformer_block import TernaryBlock  # type: ignore[import]
             self.attn_blocks = nn.ModuleList([
                 TernaryBlock(n_head, n_embed, context_length) for _ in range(N_BLOCKS)
             ])

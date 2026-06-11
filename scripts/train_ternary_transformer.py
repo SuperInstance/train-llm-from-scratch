@@ -1,26 +1,14 @@
-"""
-Training script for ternary-weight-enabled transformer training.
-
-Clones train_transformer.py but adds:
-  - TernaryTransformer/Transformer selection via config['ternary_weights']
-  - Conservation loss added to training loss (when ternary_weights=True)
-  - Confidence logging during training (when ternary_weights=True)
-  - Zone distribution tracking — heads/blocks in GREEN/YELLOW/RED (when ternary_weights=True)
-
-Usage:
-    python scripts/train_ternary_transformer.py
-"""
-
 import torch
 import torch.nn.functional as F
 import os
 import time
+import argparse
 from tqdm import tqdm
 import numpy as np
 from config.config import default_config as config
-from src.models.transformer import Transformer, TernaryTransformer
+from src.models.transformer import TernaryTransformer
 from data_loader.data_loader import get_batch_iterator
-from typing import Dict, Optional
+from typing import Dict
 
 
 # --- Runtime Diagnostics Helpers ---
@@ -70,9 +58,42 @@ def get_peak_memory_report(device: str) -> str:
     return "Peak VRAM allocated: N/A | Peak VRAM reserved: N/A"
 
 
-# --- Ternary Hyper-parameters ---
+def format_zone_distribution(zones: Dict[str, int]) -> str:
+    """Format a zone distribution dict into a human-readable string."""
+    return f"Green={zones.get('GREEN', 0)}  Yellow={zones.get('YELLOW', 0)}  Red={zones.get('RED', 0)}"
 
-TERNARY_CONSERVATION_WEIGHT = 0.01  # λ for conservation regularisation (only used when ternary_weights=True)
+
+def format_trace(step: int, trace: list) -> str:
+    """Format the full decision trace for a given step into a compact log string."""
+    lines = [f"--- Trace at step {step} ---"]
+    for block_entry in trace:
+        lines.append(f"  {block_entry}")
+    return "\n".join(lines)
+
+
+# --- Argument Parsing ---
+
+parser = argparse.ArgumentParser(description="Train a TernaryTransformer with conservation loss.")
+parser.add_argument(
+    "--ternary", action="store_true", default=False,
+    help="Enable ternary weights (TernaryTransformer with conservation loss, confidence zones, and decision traces). "
+         "Defaults to False (standard Transformer). This script always uses TernaryTransformer; "
+         "this flag is kept for interface consistency."
+)
+parser.add_argument(
+    "--trace-freq", type=int, default=5000,
+    help="Log decision trace and head-zone distribution every N steps (default: 5000)."
+)
+parser.add_argument(
+    "--conservation-coeff", type=float, default=0.01,
+    help="Coefficient for conservation loss (default: 0.01)."
+)
+args = parser.parse_args()
+
+# Override config with CLI flags
+use_ternary = args.ternary or config.get('ternary_weights', False)
+trace_freq = args.trace_freq
+conservation_coeff = args.conservation_coeff
 
 # --- Initialize the Model and Print Parameters ---
 
@@ -81,37 +102,26 @@ print(get_device_report(config['device']))
 if config['device'].startswith('cuda') and torch.cuda.is_available():
     torch.cuda.reset_peak_memory_stats()
 
-# Architecture selection based on config toggle
-use_ternary = config.get('ternary_weights', False)
-
-print("=" * 70)
-if use_ternary:
-    print("MODEL: TernaryTransformer (ternary-weight-enabled training)")
-else:
-    print("MODEL: Transformer (standard training)")
-print("=" * 70)
-
-if use_ternary:
-    model = TernaryTransformer(
-        n_head=config['n_head'],
-        n_embed=config['n_embed'],
-        context_length=config['context_length'],
-        vocab_size=config['vocab_size'],
-        N_BLOCKS=config['n_blocks']
-    ).to(config['device'])
-else:
-    model = Transformer(
-        n_head=config['n_head'],
-        n_embed=config['n_embed'],
-        context_length=config['context_length'],
-        vocab_size=config['vocab_size'],
-        N_BLOCKS=config['n_blocks'],
-        ternary_weights=False,
-    ).to(config['device'])
+model = TernaryTransformer(
+    n_head=config['n_head'],
+    n_embed=config['n_embed'],
+    context_length=config['context_length'],
+    vocab_size=config['vocab_size'],
+    N_BLOCKS=config['n_blocks']
+).to(config['device'])
 
 # Print the total number of parameters
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total number of parameters in the model: {total_params:,}")
+print(f"Ternary weights: {use_ternary} | Conservation coefficient: {conservation_coeff} | Trace frequency: {trace_freq}")
+
+# Print initial ternary diagnostics
+initial_confidence = model.confidence
+initial_zones = model.confidence_distribution()
+initial_head_zones = model.head_zone_distribution()
+print(f"Initial model confidence: {initial_confidence:.4f}")
+print(f"Initial block zone distribution: {format_zone_distribution(initial_zones)}")
+print(f"Initial head zone distribution:  {format_zone_distribution(initial_head_zones)}")
 
 # --- Optimizer Setup and Loss Tracking ---
 
@@ -120,9 +130,6 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=config['t_lr'])
 
 # List to track loss values during training.
 losses = []
-conservation_losses: list[float] = []  # Track conservation loss separately (ternary only)
-confidence_log: list[tuple[int, float]] = []       # Track confidence over time (ternary only)
-zone_log: list[tuple[int, dict, dict]] = []         # Track zone distributions (ternary only)
 
 # Define a window size for averaging recent losses in the training loop.
 AVG_WINDOW = 64
@@ -170,37 +177,6 @@ def estimate_loss(steps: int) -> Dict[str, float]:
     model.train()  # Restore the model to training mode.
     return out
 
-
-# --- Logging helper for confidence / zone info (ternary only) ---
-
-def log_confidence_stats(step: int, model: Transformer) -> None:
-    """
-    Log overall confidence and zone distribution to stdout.
-
-    Only produces output when the model has ternary weights enabled.
-    Safe to call on any model — will silently return if not ternary.
-    """
-    if not use_ternary:
-        return
-    # Only proceed if the model has these ternary-specific attributes
-    if not hasattr(model, 'confidence') or not hasattr(model, 'confidence_distribution'):
-        return
-    conf = model.confidence
-    block_zones = model.confidence_distribution()
-    head_zones = model.head_zone_distribution()
-    confidence_log.append((step, conf))
-    zone_log.append((step, block_zones, head_zones))
-    print(
-        f"  [Ternary] Confidence: {conf:.4f} | "
-        f"Block zones: G={block_zones.get('GREEN', 0)} "
-        f"Y={block_zones.get('YELLOW', 0)} "
-        f"R={block_zones.get('RED', 0)} | "
-        f"Head zones: G={head_zones.get('GREEN', 0)} "
-        f"Y={head_zones.get('YELLOW', 0)} "
-        f"R={head_zones.get('RED', 0)}"
-    )
-
-
 # --- Training Loop ---
 
 # Create a batch iterator for the training data.
@@ -224,23 +200,19 @@ for step in pbar:
         xb, yb = next(batch_iterator)
 
         # Perform a forward pass and compute the loss.
-        logits, ce_loss = model(xb, yb)
+        _, loss = model(xb, yb)
 
-        # Add conservation loss when ternary weights are active
+        # Add conservation loss for ternary model
         if use_ternary:
-            cons_loss = model.get_conservation_loss()
-            total_loss = ce_loss + TERNARY_CONSERVATION_WEIGHT * cons_loss
-            conservation_losses.append(cons_loss.item())
-            pbar.set_description(
-                f"Train loss: {np.mean(losses[-AVG_WINDOW:]):.4f} "
-                f"(cons: {np.mean(conservation_losses[-AVG_WINDOW:]):.6f})"
-            )
+            conservation = model.get_conservation_loss()
+            total_loss = loss + conservation_coeff * conservation
         else:
-            total_loss = ce_loss
-            pbar.set_description(f"Train loss: {np.mean(losses[-AVG_WINDOW:]):.4f}")
+            conservation = torch.tensor(0.0, device=config['device'])
+            total_loss = loss
 
         # Record the loss for tracking.
         losses.append(total_loss.item())
+        pbar.set_description(f"Train loss: {np.mean(losses[-AVG_WINDOW:]):.4f}")
 
         # Backpropagate the loss and update the model parameters.
         optimizer.zero_grad(set_to_none=True)
@@ -264,14 +236,43 @@ for step in pbar:
             now = time.perf_counter()
             elapsed_since_eval = now - last_eval_time
             last_eval_time = now
+
+            # Build ternary-specific diagnostics line
+            ternary_diag = ""
+            if use_ternary:
+                conf = model.confidence
+                b_zones = model.confidence_distribution()
+                h_zones = model.head_zone_distribution()
+                ternary_diag = (
+                    f", Confidence: {conf:.4f}, "
+                    f"Blocks [{format_zone_distribution(b_zones)}], "
+                    f"Heads [{format_zone_distribution(h_zones)}], "
+                    f"Conservation: {conservation.item():.6f}"
+                )
+
             print(
                 f"Step: {step}, Train loss: {train_loss:.4f}, Dev loss: {dev_loss:.4f}, "
                 f"Step time: {step_time:.3f}s, Throughput: {tokens_per_second:.2f} tokens/s, "
-                f"Elapsed since last eval: {elapsed_since_eval:.2f}s"
+                f"Elapsed since last eval: {elapsed_since_eval:.2f}s{ternary_diag}"
             )
-            # Log ternary-specific confidence / zone info
-            log_confidence_stats(step, model)
             print(get_peak_memory_report(config['device']))
+
+        # Log ternary decision trace every trace_freq steps
+        if use_ternary and step > 0 and step % trace_freq == 0:
+            # Trace info: confidence, zone distribution, and full decision trace
+            current_confidence = model.confidence
+            current_zones = model.confidence_distribution()
+            current_head_zones = model.head_zone_distribution()
+            current_conservation = conservation.item()
+
+            print(f"\n=== Ternary Trace | Step {step} ===")
+            print(f"  Model confidence: {current_confidence:.4f}")
+            print(f"  Block zones:      {format_zone_distribution(current_zones)}")
+            print(f"  Head zones:       {format_zone_distribution(current_head_zones)}")
+            print(f"  Conservation:     {current_conservation:.6f}")
+            trace_data = model.trace()
+            print(format_trace(step, trace_data))
+            print("=== End Trace ===\n")
 
         # Decay the learning rate at the specified step.
         if step == config['t_lr_decay_step']:
@@ -294,29 +295,16 @@ train_loss = evaluation_losses['train']
 dev_loss = evaluation_losses['dev']
 
 # Ensure unique model save path in case the file already exists.
-if use_ternary:
-    model_suffix = '_ternary.pt'
-else:
-    model_suffix = '.pt'
-modified_model_out_path = config['t_out_path'].replace('.pt', model_suffix)
+modified_model_out_path = config['t_out_path']
 save_tries = 0
 while os.path.exists(modified_model_out_path):
     save_tries += 1
-    model_out_name = os.path.splitext(modified_model_out_path)[0]
+    model_out_name = os.path.splitext(config['t_out_path'])[0]
     modified_model_out_path = model_out_name + f"_{save_tries}" + ".pt"
 
-# Log final ternary stats if applicable
-if use_ternary:
-    final_conf = model.confidence
-    final_block_zones = model.confidence_distribution()
-    final_head_zones = model.head_zone_distribution()
-    print(f"\n=== Final Ternary Model Stats ===")
-    print(f"Overall confidence: {final_conf:.4f}")
-    print(f"Block zones: {final_block_zones}")
-    print(f"Head zones: {final_head_zones}")
-
-# Build save dictionary (include ternary metadata when applicable)
-save_dict = {
+# Save the model's state dictionary, optimizer state, and training metadata
+# (including the runtime device / PyTorch / CUDA versions for reproducibility).
+checkpoint = {
     'model_state_dict': model.state_dict(),
     'optimizer_state_dict': optimizer.state_dict(),
     'losses': losses,
@@ -326,16 +314,26 @@ save_dict = {
     'device': config['device'],
     'pytorch_version': torch.__version__,
     'cuda_version': torch.version.cuda,
-    'ternary_weights': use_ternary,
 }
-if use_ternary:
-    save_dict['conservation_losses'] = conservation_losses
-    save_dict['confidence_log'] = confidence_log
-    save_dict['zone_log'] = zone_log
 
-# Save the model's state dictionary, optimizer state, and training metadata
-# (including the runtime device / PyTorch / CUDA versions for reproducibility).
-torch.save(save_dict, modified_model_out_path)
+if use_ternary:
+    checkpoint['ternary_weights'] = True
+    checkpoint['final_confidence'] = model.confidence
+    checkpoint['final_block_zones'] = model.confidence_distribution()
+    checkpoint['final_head_zones'] = model.head_zone_distribution()
+    checkpoint['conservation_coeff'] = conservation_coeff
+
+torch.save(checkpoint, modified_model_out_path)
 print(f"Saved model to {modified_model_out_path}")
 print(get_peak_memory_report(config['device']))
+
+# Final ternary summary
+if use_ternary:
+    final_confidence = model.confidence
+    final_zones = model.confidence_distribution()
+    final_head_zones = model.head_zone_distribution()
+    print(f"Final model confidence: {final_confidence:.4f}")
+    print(f"Final block zones: {format_zone_distribution(final_zones)}")
+    print(f"Final head zones:  {format_zone_distribution(final_head_zones)}")
+
 print(f"Finished training. Train loss: {train_loss:.4f}, Dev loss: {dev_loss:.4f}")
