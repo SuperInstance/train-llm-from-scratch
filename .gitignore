@@ -19,3 +19,6 @@ models/
 *.jsonl
 wandb/
 /ephemeral/
+
+# Rust / Pyo3 build artifacts (ternary-core crate)
+ternary-core/target/

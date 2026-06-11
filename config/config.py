@@ -13,6 +13,9 @@ N_BLOCKS = 64               # Number of transformer blocks in the model
 TRAIN_PATH = "data/train/pile_train.h5"  # File path for the training dataset
 DEV_PATH = "data/val/pile_dev.h5"      # File path for the validation dataset
 
+# Ternary weights toggle (False → standard Transformer; True → TernaryTransformer)
+TERNARY_WEIGHTS = False  # Set to True to enable ternary weight training
+
 # Transformer training parameters
 T_BATCH_SIZE = 32          # Number of samples per training batch
 T_CONTEXT_LENGTH = 16      # Context length for training batches
@@ -46,4 +49,5 @@ default_config = {
     't_lr_decayed': T_LR_DECAYED,
     't_out_path': T_OUT_PATH,
     'device': DEVICE,
+    'ternary_weights': TERNARY_WEIGHTS,
 }
